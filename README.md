@@ -15,5 +15,7 @@ ip : kalian bisa liat di tailscale yang bagian IPv4, nah salin yang itu
 user : alzzmine
 pw : 123Alzz
 
+ini menggunakan Key Dari Tailscale
+kalian Ke settings, Secret, dan Action, kalian namain TS_KEY
 enjoy guys
 ~ItsAldy
