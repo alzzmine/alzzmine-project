@@ -16,6 +16,7 @@ user : alzzmine
 pw : 123Alzz
 
 ini menggunakan Key Dari Tailscale
-kalian Ke settings, Secret, dan Action, kalian namain TS_KEY
+kalian Ke settings, Secret and Variables, Action, dan dibagian *Name kalian namain TS_KEY dan dibagian *Secret kalian salin key tailscale yang kalian buat dan tempel ke *Secret
+
 enjoy guys
 ~ItsAldy
