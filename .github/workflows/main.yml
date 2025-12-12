@@ -5,7 +5,7 @@ on:
 
 jobs:
   rdp:
-    runs-on: windows-2016
+    runs-on: windows-2025
     timeout-minutes: 419   # 6 jam 59 menit (Maximal)
 
     steps:
