@@ -1,0 +1,66 @@
+name: Remote Dekstop Protocol (RDP) by ItsAldy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp:
+    runs-on: windows-2022
+    timeout-minutes: 419   # 6 jam 59 menit (Maximal)
+
+    steps:
+
+      - name: Download & Install Tailscale
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "tailscale.exe"
+          Start-Process "tailscale.exe" -ArgumentList "/S" -Wait
+
+      - name: Connect Tailscale (MagicDNS + Hostname)
+        shell: powershell
+        run: |
+          $paths = @(
+            "C:\Program Files\Tailscale\tailscale.exe",
+            "C:\Program Files (x86)\Tailscale\tailscale.exe"
+          )
+          foreach ($p in $paths) {
+            if (Test-Path $p) { $ts = $p; break }
+          }
+          if (-not $ts) { Write-Host "Tailscale not found!"; exit 1 }
+
+          & "$ts" up --authkey ${{ secrets.TS_KEY }} --hostname padukaalzz --accept-dns --accept-routes
+
+      - name: Create RDP User (alzzmine)
+        shell: powershell
+        run: |
+          $password = ConvertTo-SecureString "123Alzz" -AsPlainText -Force
+          New-LocalUser -Name "alzzmine" -Password $password
+          Add-LocalGroupMember -Group "Administrators" -Member "alzzmine"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "alzzmine"
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      - name: GPU Unlock (WDDM Accel Boost)
+        shell: powershell
+        run: |
+          reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v SystemResponsiveness /t REG_DWORD /d 0 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v GPU Priority /t REG_DWORD /d 8 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v Priority /t REG_DWORD /d 6 /f
+
+      - name: Anti Sleep / Runner Keep Alive
+        shell: powershell
+        run: |
+          powercfg -change -standby-timeout-ac 0
+          powercfg -change -monitor-timeout-ac 0
+          powercfg -change -disk-timeout-ac 0
+          Write-Host "Running for 6 JAM 59 MENIT..."
+          while ($true) { Write-Output "alive"; Start-Sleep -Seconds 30 }
+
+      - name: Show Tailscale Status
+        shell: powershell
+        run: |
+          & "C:\Program Files\Tailscale\tailscale.exe" status
