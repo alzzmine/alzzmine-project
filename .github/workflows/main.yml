@@ -1,4 +1,4 @@
-name: RDP WINDOWS
+name: RDP
 
 on:
   workflow_dispatch:
@@ -51,8 +51,8 @@ jobs:
           reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v GPU Priority /t REG_DWORD /d 8 /f
           reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v Priority /t REG_DWORD /d 6 /f
 
-     - name: 🔐 RDP User & Password
-       run: |
+      - name: 🔐 RDP User & Password
+        run: |
           Write-Output "======================================"
           Write-Output " RDP INFORMATION"
           Write-Output "--------------------------------------"
