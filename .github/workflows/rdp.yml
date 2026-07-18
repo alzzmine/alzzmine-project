@@ -1,0 +1,73 @@
+name: Windows Server 2022 RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Rename Computer
+        shell: powershell
+        run: |
+          Rename-Computer -NewName "zelsdev" -Force
+
+      - name: Create User
+        shell: powershell
+        run: |
+          $password = ConvertTo-SecureString "oneonlydzeel" -AsPlainText -Force
+
+          if (Get-LocalUser -Name "dzeel" -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name "dzeel" -Password $password
+          } else {
+              New-LocalUser -Name "dzeel" -Password $password -FullName "Dzeel"
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "dzeel" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "dzeel" -ErrorAction SilentlyContinue
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          winget install Tailscale.Tailscale --silent --accept-package-agreements --accept-source-agreements
+
+      - name: Connect Tailscale
+        shell: powershell
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          if (!(Test-Path $ts)) {
+              $ts = "C:\Program Files (x86)\Tailscale\tailscale.exe"
+          }
+
+          & "$ts" down
+          & "$ts" up `
+            --reset `
+            --authkey "${{ secrets.TS_KEY }}" `
+            --hostname "zelsdev" `
+            --accept-dns `
+            --accept-routes
+
+      - name: Show Tailscale IP
+        shell: powershell
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          if (!(Test-Path $ts)) {
+              $ts = "C:\Program Files (x86)\Tailscale\tailscale.exe"
+          }
+
+          & "$ts" ip
+
+      - name: Keep Alive
+        shell: powershell
+        run: |
+          while ($true) {
+            Start-Sleep -Seconds 60
+          }
