@@ -17,16 +17,9 @@ jobs:
       - name: Create User
         shell: powershell
         run: |
-          $password = ConvertTo-SecureString "oneonlydzeel" -AsPlainText -Force
-
-          if (Get-LocalUser -Name "dzeel" -ErrorAction SilentlyContinue) {
-              Set-LocalUser -Name "dzeel" -Password $password
-          } else {
-              New-LocalUser -Name "dzeel" -Password $password -FullName "Dzeel"
-          }
-
-          Add-LocalGroupMember -Group "Administrators" -Member "dzeel" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "dzeel" -ErrorAction SilentlyContinue
+         net user dzeel oneonlydzeel /add
+         net localgroup Administrators dzeel /add
+         net localgroup "Remote Desktop Users" dzeel /add
 
       - name: Enable RDP
         shell: powershell
