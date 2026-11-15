@@ -1,0 +1,281 @@
+name: DeZ Windows RDP - Cloud Desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows_version:
+        description: "Pilih image Windows Server GitHub Actions"
+        required: true
+        default: windows-2025
+        type: choice
+        options:
+          - windows-2025
+          - windows-2022
+      rdp_user:
+        description: "Username akun RDP"
+        required: true
+        default: dezels
+        type: string
+      rdp_password:
+        description: "Password akun RDP (minimal 6 karakter)"
+        required: true
+        type: string
+      ts_hostname:
+        description: "Hostname perangkat di Tailscale"
+        required: true
+        default: dezwindows
+        type: string
+      utilities:
+        description: "Paket utilitas tambahan"
+        required: true
+        default: standard
+        type: choice
+        options:
+          - none
+          - standard
+          - developer
+      performance_profile:
+        description: "Profil optimasi ringan untuk remote desktop"
+        required: true
+        default: balanced
+        type: choice
+        options:
+          - balanced
+          - responsiveness
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dez-windows-rdp-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rdp:
+    name: Start Windows Cloud Desktop
+    runs-on: ${{ inputs.windows_version }}
+    timeout-minutes: 360
+
+    steps:
+      - name: Validate configuration
+        shell: powershell
+        env:
+          RDP_USER: ${{ inputs.rdp_user }}
+          TS_HOSTNAME: ${{ inputs.ts_hostname }}
+          TS_KEY: ${{ secrets.TS_KEY }}
+          RDP_PASSWORD: ${{ inputs.rdp_password }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:TS_KEY)) {
+            throw 'GitHub Secret TS_KEY belum diatur.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw 'Password RDP belum diisi pada form Run workflow.'
+          }
+          # Mask password agar tidak muncul jika tanpa sengaja tercetak di log.
+          Write-Host "::add-mask::$env:RDP_PASSWORD"
+          if ($env:RDP_PASSWORD.Length -lt 6) {
+            throw 'Password RDP minimal 6 karakter. Gunakan password acak yang unik.'
+          }
+          if ($env:RDP_USER -notmatch '^[A-Za-z][A-Za-z0-9._-]{2,19}$') {
+            throw 'Username harus 3-20 karakter, diawali huruf, dan hanya berisi huruf, angka, titik, garis bawah, atau tanda hubung.'
+          }
+          if ($env:TS_HOSTNAME -notmatch '^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$') {
+            throw 'Hostname Tailscale tidak valid.'
+          }
+          Write-Host 'Konfigurasi dasar valid. Nilai secret tidak akan ditampilkan.'
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $installer = Join-Path $env:RUNNER_TEMP 'tailscale-setup.exe'
+          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $installer
+          $signature = Get-AuthenticodeSignature -FilePath $installer
+          if ($signature.Status -ne 'Valid') {
+            throw "Tanda tangan installer Tailscale tidak valid: $($signature.Status)"
+          }
+          $process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Installer Tailscale gagal dengan exit code $($process.ExitCode)."
+          }
+          $ts = @(
+            'C:\Program Files\Tailscale\tailscale.exe',
+            'C:\Program Files (x86)\Tailscale\tailscale.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $ts) { throw 'tailscale.exe tidak ditemukan setelah instalasi.' }
+          "TS_EXE=$ts" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TS_KEY: ${{ secrets.TS_KEY }}
+          TS_HOSTNAME: ${{ inputs.ts_hostname }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:TS_EXE" up "--auth-key=$env:TS_KEY" "--hostname=$env:TS_HOSTNAME" --accept-dns=false
+          if ($LASTEXITCODE -ne 0) { throw 'Gagal menghubungkan perangkat ke Tailscale.' }
+
+          $ip = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            $ip = (& "$env:TS_EXE" ip -4 2>$null | Select-Object -First 1)
+            if ($ip -match '^100\.') { break }
+            Start-Sleep -Seconds 2
+          }
+          if ($ip -notmatch '^100\.') { throw 'Alamat IPv4 Tailscale belum tersedia.' }
+          "TS_IPV4=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tailscale tersambung. IPv4: $ip"
+
+      - name: Create Administrator RDP account
+        shell: powershell
+        env:
+          RDP_USER: ${{ inputs.rdp_user }}
+          RDP_PASSWORD: ${{ inputs.rdp_password }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue) {
+            throw 'Akun dengan username tersebut sudah ada. Pilih username lain.'
+          }
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USER -Password $securePassword -FullName 'DeZ Administrator' -Description 'Temporary Administrator account for DeZ Windows RDP' | Out-Null
+          Add-LocalGroupMember -Group 'Administrators' -Member $env:RDP_USER
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USER -ErrorAction SilentlyContinue
+          Write-Host 'Akun RDP dibuat dengan hak Administrator.'
+
+      - name: Enable RDP with Tailscale-only firewall access
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rdpKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+          New-ItemProperty -Path $rdpKey -Name 'fDenyTSConnections' -PropertyType DWord -Value 0 -Force | Out-Null
+          $tcpKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          New-ItemProperty -Path $tcpKey -Name 'UserAuthentication' -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $tcpKey -Name 'SecurityLayer' -PropertyType DWord -Value 2 -Force | Out-Null
+
+          # Nonaktifkan rule RDP bawaan yang dapat membuka port ke jaringan lain.
+          Get-NetFirewallRule -Name 'RemoteDesktop*' -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule -ErrorAction SilentlyContinue
+
+          # RDP hanya menerima koneksi dari rentang IPv4 Tailscale.
+          Get-NetFirewallRule -DisplayName 'DeZ RDP - Tailscale only' -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName 'DeZ RDP - Tailscale only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+          Write-Host 'RDP aktif dengan Network Level Authentication dan firewall terbatas ke jaringan Tailscale.'
+
+      - name: Apply safe remote desktop performance settings
+        shell: powershell
+        env:
+          PERFORMANCE_PROFILE: ${{ inputs.performance_profile }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Pertahankan tweak Multimedia SystemProfile dari workflow awal.
+          # Nilai ini bukan overclock dan tidak menambah kemampuan GPU.
+          $base = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+          if (-not (Test-Path $base)) { New-Item -Path $base -Force | Out-Null }
+          New-ItemProperty -Path $base -Name 'SystemResponsiveness' -PropertyType DWord -Value 10 -Force | Out-Null
+          $games = Join-Path $base 'Tasks\Games'
+          if (-not (Test-Path $games)) { New-Item -Path $games -Force | Out-Null }
+          New-ItemProperty -Path $games -Name 'GPU Priority' -PropertyType DWord -Value 8 -Force | Out-Null
+          New-ItemProperty -Path $games -Name 'Priority' -PropertyType DWord -Value 6 -Force | Out-Null
+
+          # Gunakan power plan performa jika tersedia.
+          $plans = powercfg /list
+          if ($plans -match 'High performance') {
+            powercfg /setactive SCHEME_MIN | Out-Null
+          }
+          powercfg /change -standby-timeout-ac 0 2>$null
+
+          if ($env:PERFORMANCE_PROFILE -eq 'responsiveness') {
+            # Kurangi animasi visual untuk sesi remote; tidak mengubah resolusi atau driver GPU.
+            $visual = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects'
+            if (-not (Test-Path $visual)) { New-Item -Path $visual -Force | Out-Null }
+            New-ItemProperty -Path $visual -Name 'VisualFXSetting' -PropertyType DWord -Value 2 -Force | Out-Null
+          }
+          Write-Host "Profil performance diterapkan: $env:PERFORMANCE_PROFILE"
+
+      - name: Install optional utilities
+        if: ${{ inputs.utilities != 'none' }}
+        shell: powershell
+        env:
+          UTILITIES: ${{ inputs.utilities }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
+            throw 'Chocolatey tidak tersedia pada image runner ini; instalasi utilitas dibatalkan agar tidak menjalankan bootstrap script eksternal.'
+          }
+          $packages = @('7zip.install', 'notepadplusplus')
+          if ($env:UTILITIES -eq 'developer') {
+            $packages += @('vscode', 'googlechrome')
+          }
+          foreach ($package in $packages) {
+            choco install $package --yes --no-progress --limit-output
+            if ($LASTEXITCODE -ne 0) { throw "Instalasi paket $package gagal." }
+          }
+          Write-Host "Utilitas terpasang: $($packages -join ', ')"
+
+      - name: Network diagnostics
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host '===== NETWORK DIAGNOSTICS ====='
+          Write-Host "Tailscale IPv4: $env:TS_IPV4"
+          Write-Host 'DNS lookup github.com:'
+          Resolve-DnsName github.com -ErrorAction Continue | Select-Object -First 4 Name,Type,IPAddress | Format-Table -AutoSize
+          Write-Host 'HTTPS connectivity test (1.1.1.1:443):'
+          Test-NetConnection -ComputerName 1.1.1.1 -Port 443 -InformationLevel Detailed |
+            Select-Object ComputerName,RemoteAddress,RemotePort,TcpTestSucceeded | Format-List
+          Write-Host 'IPv4 interfaces:'
+          Get-NetIPConfiguration | Select-Object InterfaceAlias,IPv4Address,IPv4DefaultGateway | Format-List
+
+      - name: System information
+        shell: powershell
+        run: |
+          Write-Host '===== SYSTEM INFORMATION ====='
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber,OSArchitecture,@{N='RAM_GB';E={[math]::Round($_.TotalVisibleMemorySize / 1MB, 2)}} | Format-List
+          Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed | Format-List
+          Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion | Format-Table -AutoSize
+          Get-Volume | Where-Object DriveLetter | Select-Object DriveLetter,FileSystemLabel,@{N='SizeGB';E={[math]::Round($_.Size / 1GB, 1)}},@{N='FreeGB';E={[math]::Round($_.SizeRemaining / 1GB, 1)}} | Format-Table -AutoSize
+          Get-Service -Name TermService,Tailscale | Select-Object Name,Status,StartType | Format-Table -AutoSize
+
+      - name: RDP connection details
+        shell: powershell
+        env:
+          RDP_USER: ${{ inputs.rdp_user }}
+          TS_HOSTNAME: ${{ inputs.ts_hostname }}
+        run: |
+          Write-Host '========================================'
+          Write-Host ' DEZ WINDOWS RDP - CONNECTION DETAILS'
+          Write-Host '========================================'
+          Write-Host "Address  : $env:TS_IPV4"
+          Write-Host "Hostname : $env:TS_HOSTNAME"
+          Write-Host 'Port     : 3389'
+          Write-Host "Username : $env:RDP_USER"
+          Write-Host 'Account  : Administrator'
+          Write-Host 'Password : supplied in Run workflow form (masked in logs)'
+          Write-Host 'Network  : Tailscale only'
+          Write-Host '========================================'
+
+      - name: Keep runner awake
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host 'Windows desktop aktif sampai workflow dihentikan atau batas 6 jam tercapai.'
+          while ($true) {
+            $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $rdp = (Get-Service -Name TermService).Status
+            $ts = (Get-Service -Name Tailscale).Status
+            Write-Host "[$now] runner alive | RDP=$rdp | Tailscale=$ts"
+            Start-Sleep -Seconds 60
+          }
+
+      - name: Cleanup Tailscale session
+        if: ${{ always() }}
+        shell: powershell
+        run: |
+          if ($env:TS_EXE -and (Test-Path $env:TS_EXE)) {
+            & "$env:TS_EXE" down 2>$null
+          }
