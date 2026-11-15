@@ -1,0 +1,250 @@
+name: Windows RDP - 1-6 Jam
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows_version:
+        description: "Versi Windows Server"
+        required: true
+        default: "windows-2022"
+        type: choice
+        options:
+          - windows-2025
+          - windows-2022
+          - windows-2019
+      rdp_user:
+        description: "Username RDP"
+        required: true
+        default: "dezels"
+        type: string
+      rdp_pass:
+        description: "Password RDP (minimal 6 karakter)"
+        required: true
+        type: string
+      ts_hostname:
+        description: "Hostname di Tailscale"
+        required: true
+        default: "dezwindows"
+        type: string
+      duration_hours:
+        description: "Durasi RDP (jam), auto-stop setelah ini"
+        required: true
+        default: "6"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
+          - "6"
+      install_discord:
+        description: "Install Discord (latest)?"
+        required: true
+        default: false
+        type: boolean
+      install_vscode:
+        description: "Install VS Code (latest)?"
+        required: true
+        default: false
+        type: boolean
+      install_winrar:
+        description: "Install WinRAR (latest)?"
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  rdp:
+    runs-on: ${{ inputs.windows_version }}
+    timeout-minutes: 360   # Batas keras runner GitHub = 6 jam
+
+    env:
+      RDP_USER: ${{ inputs.rdp_user }}
+      RDP_PASS: ${{ inputs.rdp_pass }}
+      TS_HOSTNAME: ${{ inputs.ts_hostname }}
+      DURATION_HOURS: ${{ inputs.duration_hours }}
+
+    steps:
+
+      - name: ✅ Validasi Input & Set Timer
+        shell: powershell
+        run: |
+          # Sembunyiin password dari log
+          Write-Host "::add-mask::$env:RDP_PASS"
+          if ([string]::IsNullOrEmpty($env:RDP_PASS) -or $env:RDP_PASS.Length -lt 6) {
+            Write-Host "Password minimal 6 karakter!"
+            exit 1
+          }
+          Write-Host "Password OK (panjang: $($env:RDP_PASS.Length) karakter)"
+
+          # Hitung waktu auto-stop (dihitung dari awal job, jadi waktu setup ikut kehitung).
+          # Dibatasi 355 menit supaya job selesai rapi sebelum batas 6 jam GitHub.
+          $limitMin = [Math]::Min([int]$env:DURATION_HOURS * 60, 355)
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes($limitMin).ToUnixTimeSeconds()
+          "DEADLINE_UNIX=$deadline" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Auto-stop dalam $limitMin menit"
+
+      - name: 📥 Install Tailscale
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "tailscale.exe"
+          Start-Process ".\tailscale.exe" -ArgumentList "/S" -Wait
+
+      - name: 🔌 Connect Tailscale
+        shell: powershell
+        env:
+          TS_KEY: ${{ secrets.TS_KEY }}
+        run: |
+          $ts = @(
+            "C:\Program Files\Tailscale\tailscale.exe",
+            "C:\Program Files (x86)\Tailscale\tailscale.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $ts) { Write-Host "Tailscale not found!"; exit 1 }
+
+          & "$ts" up --authkey "$env:TS_KEY" --hostname "$env:TS_HOSTNAME" --accept-dns --accept-routes
+          if ($LASTEXITCODE -ne 0) { Write-Host "Tailscale up gagal!"; exit 1 }
+
+          # Simpan path buat step berikutnya
+          "TS_EXE=$ts" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 🔓 Longgarin Password Policy
+        shell: powershell
+        run: |
+          # Biar password simpel (>= 6 karakter) nggak ditolak Windows
+          secedit /export /cfg "$env:TEMP\secpol.cfg" | Out-Null
+          (Get-Content "$env:TEMP\secpol.cfg") `
+            -replace 'PasswordComplexity\s*=\s*\d+', 'PasswordComplexity = 0' `
+            -replace 'MinimumPasswordLength\s*=\s*\d+', 'MinimumPasswordLength = 0' |
+            Set-Content "$env:TEMP\secpol.cfg"
+          secedit /configure /db "$env:windir\security\local.sdb" /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY | Out-Null
+          Remove-Item "$env:TEMP\secpol.cfg" -Force
+
+      - name: 🛡 Create RDP User
+        shell: powershell
+        run: |
+          $password = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USER -Password $password -PasswordNeverExpires -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER
+
+      - name: 🖥 Enable RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+      - name: 🚀 Performance Tweak
+        shell: powershell
+        run: |
+          # Catatan: runner GitHub nggak punya GPU, ini cuma tuning prioritas CPU/multimedia
+          $base = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+          Set-ItemProperty -Path $base -Name "SystemResponsiveness" -Value 0 -Type DWord
+          $games = "$base\Tasks\Games"
+          if (-not (Test-Path $games)) { New-Item -Path $games -Force | Out-Null }
+          Set-ItemProperty -Path $games -Name "GPU Priority" -Value 8 -Type DWord
+          Set-ItemProperty -Path $games -Name "Priority" -Value 6 -Type DWord
+
+      # ---------- Software opsional (kalau gagal, RDP tetap lanjut) ----------
+
+      - name: 💻 Install VS Code
+        if: ${{ inputs.install_vscode }}
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $out = "$env:TEMP\vscode-setup.exe"
+          Invoke-WebRequest -Uri "https://update.code.visualstudio.com/latest/win32-x64/stable" -OutFile $out
+          Start-Process $out -ArgumentList "/VERYSILENT","/NORESTART","/MERGETASKS=!runcode,desktopicon,addtopath" -Wait
+          Write-Host "VS Code terinstall."
+
+      - name: 🗜 Install WinRAR
+        if: ${{ inputs.install_winrar }}
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          # Cari versi terbaru (x64) dari halaman download resmi RARLAB
+          $page = (Invoke-WebRequest -Uri "https://www.rarlab.com/download.htm" -UseBasicParsing).Content
+          $m = [regex]::Match($page, 'href="(/rar/winrar-x64-\d+\.exe)"')
+          if (-not $m.Success) { Write-Host "Link WinRAR terbaru nggak ketemu!"; exit 1 }
+          $url = "https://www.rarlab.com" + $m.Groups[1].Value
+          Write-Host "Download: $url"
+          $out = "$env:TEMP\winrar-setup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          Start-Process $out -ArgumentList "/S" -Wait
+          Write-Host "WinRAR terinstall."
+
+      - name: 💬 Install Discord
+        if: ${{ inputs.install_discord }}
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          # Discord itu per-user, jadi diinstall langsung ke profil user RDP
+          $setup = "C:\Users\Public\DiscordSetup.exe"
+          Invoke-WebRequest -Uri "https://discord.com/api/download?platform=win" -OutFile $setup -UserAgent "Mozilla/5.0"
+
+          $userDiscord = "C:\Users\$env:RDP_USER\AppData\Local\Discord\Update.exe"
+          try {
+            $cred = New-Object System.Management.Automation.PSCredential(".\$env:RDP_USER", (ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force))
+            $p = Start-Process $setup -ArgumentList "-s" -Credential $cred -LoadUserProfile -WorkingDirectory "C:\Users\Public" -PassThru
+            $p | Wait-Process -Timeout 180 -ErrorAction SilentlyContinue
+          } catch {
+            Write-Host "Install ke profil user gagal: $($_.Exception.Message)"
+          }
+
+          if (Test-Path $userDiscord) {
+            Write-Host "Discord terinstall di profil $env:RDP_USER."
+          } else {
+            # Fallback: install di user runner, lalu bikin shortcut di Desktop semua user
+            Write-Host "Fallback: install di user runner + shortcut publik."
+            Start-Process $setup -ArgumentList "-s" -Wait
+            Start-Sleep -Seconds 20
+            $upd = Join-Path $env:LOCALAPPDATA "Discord\Update.exe"
+            if (-not (Test-Path $upd)) { Write-Host "Discord gagal terinstall!"; exit 1 }
+            $ws = New-Object -ComObject WScript.Shell
+            $lnk = $ws.CreateShortcut("C:\Users\Public\Desktop\Discord.lnk")
+            $lnk.TargetPath = $upd
+            $lnk.Arguments = "--processStart Discord.exe"
+            $lnk.Save()
+          }
+
+          # Tutup Discord yang auto-jalan setelah install
+          Get-Process -Name Discord -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+      - name: 🔐 RDP Info
+        shell: powershell
+        run: |
+          $ip = (& "$env:TS_EXE" ip -4 | Select-Object -First 1)
+          $stop = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:DEADLINE_UNIX)
+          $wib = [TimeZoneInfo]::ConvertTime($stop, [TimeZoneInfo]::FindSystemTimeZoneById("SE Asia Standard Time"))
+          Write-Output "======================================"
+          Write-Output " RDP INFORMATION"
+          Write-Output "--------------------------------------"
+          Write-Output " IP        : $ip"
+          Write-Output " HOST      : $env:TS_HOSTNAME"
+          Write-Output " USERNAME  : $env:RDP_USER"
+          Write-Output " PASSWORD  : (sesuai yang lo isi pas trigger)"
+          Write-Output " DURASI    : $env:DURATION_HOURS jam"
+          Write-Output " AUTO-STOP : $($wib.ToString('HH:mm')) WIB"
+          Write-Output "======================================"
+
+      - name: 🟢 Keep Alive (Auto-Stop)
+        shell: powershell
+        run: |
+          powercfg -change -standby-timeout-ac 0
+          powercfg -change -monitor-timeout-ac 0
+          powercfg -change -disk-timeout-ac 0
+
+          $deadline = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:DEADLINE_UNIX)
+          Write-Host "Jalan sampai auto-stop ($env:DURATION_HOURS jam)..."
+          while ([DateTimeOffset]::UtcNow -lt $deadline) {
+            $left = [int]($deadline - [DateTimeOffset]::UtcNow).TotalMinutes
+            Write-Output "alive $(Get-Date -Format 'HH:mm:ss') | sisa ~$left menit"
+            Start-Sleep -Seconds 30
+          }
+          Write-Host "Waktu habis, auto-stop. Runner dimatiin."
